@@ -37,11 +37,14 @@ import argparse
 import contextlib
 import hashlib
 import io
+import json
 import logging
+import os
 import pathlib
 import re
 import sys
 import textwrap
+import traceback
 import typing as t
 from distutils.util import strtobool as strtoint
 
@@ -55,13 +58,13 @@ from pypiserver.backend import (
     get_file_backend,
     BackendProxy,
 )
+log = logging.getLogger(__name__)
 
 # The `passlib` requirement is optional, so we need to verify its import here.
 try:
     from passlib.apache import HtpasswdFile
 except ImportError:
     HtpasswdFile = None
-
 
 # The "strtobool" function in distutils does a nice job at parsing strings,
 # but returns an integer. This just wraps it in a boolean call so that we
@@ -75,6 +78,7 @@ class DEFAULTS:
     """Config defaults."""
 
     AUTHENTICATE = ["update"]
+    PERMISSION_VERIFY = ["."]
     FALLBACK_URL = "https://pypi.org/simple/"
     HEALTH_ENDPOINT = "/health"
     HASH_ALGO = "md5"
@@ -88,6 +92,43 @@ class DEFAULTS:
     PORT = 8080
     SERVER_METHOD = "auto"
     BACKEND = "auto"
+
+
+class VerifyPkgFile:
+    def __init__(self, path=None):
+        self._path = path
+        self._mtime = 0
+        self.content = {}
+        self.load()
+
+    def load_if_changed(self):
+        """Reload from ``self.path`` only if file has changed since last load"""
+        if not self._path:
+            raise RuntimeError("%r is not bound to a local file" % self)
+        if self._mtime and self._mtime == os.path.getmtime(self._path):
+            return False
+        try:
+            self.load()
+        except Exception:
+            log.error("read verify_file fail.{}".format(self._path, traceback.format_exc()))
+        return True
+
+    def load(self):
+        if self._path is not None:
+            try:
+                with open(self._path, "r") as f:
+                    self.content = json.load(f)
+                os.path.getmtime(self._path)
+            except Exception:
+                raise RuntimeError("read verify_file fail.{}".format(self._path, traceback.format_exc()))
+
+    def check_pkg(self, user, pkg):
+        log.info("check user:{} pkg:{}".format(user, pkg))
+        if user in self.content:
+            pkg_list = self.content[user]
+            log.info("user:{} pkg_list:{}".format(user, pkg_list))
+            return pkg in pkg_list
+        return False
 
 
 def auth_arg(arg: str) -> t.List[str]:
@@ -105,6 +146,29 @@ def auth_arg(arg: str) -> t.List[str]:
     if "." in items and len(items) > 1:
         raise argparse.ArgumentTypeError(
             "Invalid authentication options. `.` (no authentication) "
+            "must be specified alone."
+        )
+
+    # The "." is just an indicator for no auth, so we return an empty auth list
+    # if it was present.
+    return [i for i in items if not i == "."]
+
+
+def permission_verify_arg(arg: str) -> t.List[str]:
+    """Parse the permission verify argument."""
+    # Split on commas, remove duplicates, remove whitespace, ensure lowercase.
+    # Sort so that they'll have a consistent ordering.
+    items = sorted(list(set(i.strip().lower() for i in arg.split(","))))
+    # Throw for any invalid options
+    if any(i not in ("download_pkg", "remove_pkg", "upload_pkg", ".") for i in items):
+        raise ValueError(
+            "Invalid authentication option. Valid values are download_pkg, remove_pkg "
+            " and upload_pkg or . (for no permission verify)."
+        )
+    # The "no permission verify" option must be specified in isolation.
+    if "." in items and len(items) > 1:
+        raise argparse.ArgumentTypeError(
+            "Invalid verify options. `.` (no permission verify) "
             "must be specified alone."
         )
 
@@ -381,6 +445,24 @@ def get_parser() -> argparse.ArgumentParser:
         ),
     )
     run_parser.add_argument(
+        "--verify",
+        default=DEFAULTS.PERMISSION_VERIFY,
+        type=permission_verify_arg,
+        help=(
+            "Comma-separated list of (case-insensitive) actions to "
+            "permission verify (options: upload_pkg, remove_pkg,download_pkg or .; default: .)."
+        ),
+    )
+    run_parser.add_argument(
+        "--verify-file",
+        metavar="VERIFY_FILE",
+        help=(
+            "Specify a permissions profile path."
+            "profile content example:"
+            "{'admin':['package1','package2']}"
+        ),
+    )
+    run_parser.add_argument(
         "--disable-fallback",
         action="store_true",
         help=(
@@ -553,14 +635,14 @@ class _ConfigCommon:
     hash_algo: t.Optional[str] = None
 
     def __init__(
-        self,
-        roots: t.List[pathlib.Path],
-        verbosity: int,
-        log_frmt: str,
-        log_file: t.Optional[str],
-        log_stream: t.Optional[t.IO],
-        hash_algo: t.Optional[str],
-        backend_arg: str,
+            self,
+            roots: t.List[pathlib.Path],
+            verbosity: int,
+            log_frmt: str,
+            log_file: t.Optional[str],
+            log_stream: t.Optional[t.IO],
+            hash_algo: t.Optional[str],
+            backend_arg: str,
     ) -> None:
         """Construct a RuntimeConfig."""
         # Global arguments
@@ -588,14 +670,14 @@ class _ConfigCommon:
 
     @classmethod
     def from_namespace(
-        cls: t.Type[TConf], namespace: argparse.Namespace
+            cls: t.Type[TConf], namespace: argparse.Namespace
     ) -> TConf:
         """Construct a config from an argparse namespace."""
         return cls(**cls.kwargs_from_namespace(namespace))
 
     @staticmethod
     def kwargs_from_namespace(
-        namespace: argparse.Namespace,
+            namespace: argparse.Namespace,
     ) -> t.Dict[str, t.Any]:
         """Convert a namespace into __init__ kwargs for this class."""
         return dict(
@@ -673,23 +755,26 @@ class RunConfig(_ConfigCommon):
     """A config for the Run command."""
 
     def __init__(
-        self,
-        port: int,
-        host: str,
-        authenticate: t.List[str],
-        password_file: t.Optional[str],
-        disable_fallback: bool,
-        fallback_url: str,
-        health_endpoint: str,
-        server_method: str,
-        overwrite: bool,
-        welcome_msg: str,
-        cache_control: t.Optional[int],
-        log_req_frmt: str,
-        log_res_frmt: str,
-        log_err_frmt: str,
-        auther: t.Optional[t.Callable[[str, str], bool]] = None,
-        **kwargs: t.Any,
+            self,
+            port: int,
+            host: str,
+            authenticate: t.List[str],
+            password_file: t.Optional[str],
+            verify: t.List[str],
+            verify_file: t.Optional[str],
+            disable_fallback: bool,
+            fallback_url: str,
+            health_endpoint: str,
+            server_method: str,
+            overwrite: bool,
+            welcome_msg: str,
+            cache_control: t.Optional[int],
+            log_req_frmt: str,
+            log_res_frmt: str,
+            log_err_frmt: str,
+            auther: t.Optional[t.Callable[[str, str], bool]] = None,
+            verify_pkg: t.Optional[t.Callable[[str, str], bool]] = None,
+            **kwargs: t.Any,
     ) -> None:
         """Construct a RuntimeConfig."""
         super().__init__(**kwargs)
@@ -697,6 +782,8 @@ class RunConfig(_ConfigCommon):
         self.host = host
         self.authenticate = authenticate
         self.password_file = password_file
+        self.verify = verify
+        self.verify_file = verify_file
         self.disable_fallback = disable_fallback
         self.fallback_url = fallback_url
         self.health_endpoint = health_endpoint
@@ -710,10 +797,11 @@ class RunConfig(_ConfigCommon):
         # Derived properties
         self._derived_properties = self._derived_properties + ("auther",)
         self.auther = self.get_auther(auther)
+        self.verify_pkg = self.get_verify_pkg(verify_pkg)
 
     @classmethod
     def kwargs_from_namespace(
-        cls, namespace: argparse.Namespace
+            cls, namespace: argparse.Namespace
     ) -> t.Dict[str, t.Any]:
         """Convert a namespace into __init__ kwargs for this class."""
         return {
@@ -722,6 +810,8 @@ class RunConfig(_ConfigCommon):
             "host": namespace.host,
             "authenticate": namespace.authenticate,
             "password_file": namespace.passwords,
+            "verify": namespace.verify,
+            "verify_file": namespace.verify_file,
             "disable_fallback": namespace.disable_fallback,
             "fallback_url": namespace.fallback_url,
             "health_endpoint": namespace.health_endpoint,
@@ -735,7 +825,7 @@ class RunConfig(_ConfigCommon):
         }
 
     def get_auther(
-        self, passed_auther: t.Optional[t.Callable[[str, str], bool]]
+            self, passed_auther: t.Optional[t.Callable[[str, str], bool]]
     ) -> t.Callable[[str, str], bool]:
         """Create or retrieve an authentication function."""
         # The auther may be specified directly as a kwarg in the API interface
@@ -776,17 +866,39 @@ class RunConfig(_ConfigCommon):
 
         return auther
 
+    def get_verify_pkg(
+            self, verify_pkg: t.Optional[t.Callable[[str, str], bool]]
+    ) -> t.Callable[[str, str], bool]:
+        if verify_pkg:
+            return verify_pkg
+        if self.verify_file == "." or self.verify == []:
+            if self.verify_file != "." or self.verify != []:
+                sys.exit(
+                    "When verify-ops-list is empty (--verify=.), verify-file"
+                    f" (--verify-file={self.verify_file!r}) must also be empty ('.')!"
+                )
+            return lambda _uname, _pkg: True
+        if self.verify_file is None:
+            return lambda _uname, _pkg: False
+        loaded_verify_file = VerifyPkgFile(self.verify_file)
+
+        def auther(uname: str, pkg: str) -> bool:
+            loaded_verify_file.load_if_changed()
+            return loaded_verify_file.check_pkg(uname, pkg)
+
+        return auther
+
 
 class UpdateConfig(_ConfigCommon):
     """A config for the Update command."""
 
     def __init__(
-        self,
-        execute: bool,
-        download_directory: t.Optional[str],
-        allow_unstable: bool,
-        ignorelist: t.List[str],
-        **kwargs: t.Any,
+            self,
+            execute: bool,
+            download_directory: t.Optional[str],
+            allow_unstable: bool,
+            ignorelist: t.List[str],
+            **kwargs: t.Any,
     ) -> None:
         """Construct an UpdateConfig."""
         super().__init__(**kwargs)
@@ -797,7 +909,7 @@ class UpdateConfig(_ConfigCommon):
 
     @classmethod
     def kwargs_from_namespace(
-        cls, namespace: argparse.Namespace
+            cls, namespace: argparse.Namespace
     ) -> t.Dict[str, t.Any]:
         """Convert a namespace into __init__ kwargs for this class."""
         return {
@@ -828,7 +940,7 @@ class Config:
 
     @classmethod
     def from_args(
-        cls, args: t.Optional[t.Sequence[str]] = None
+            cls, args: t.Optional[t.Sequence[str]] = None
     ) -> Configuration:
         """Construct a Config from the passed args or sys.argv."""
         # If pulling args from sys.argv (commandline arguments), argv[0] will

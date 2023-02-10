@@ -49,6 +49,17 @@ class auth:
         return protector
 
 
+def pkg_verify(action, pkg):
+    if action in config.verify:
+        if not request.auth:
+            raise HTTPError(
+                401, headers={"WWW-Authenticate": 'Basic realm="pypi"'}
+            )
+        log.info("pkg_verify {} {}", request.auth[0], pkg)
+        if not config.verify_pkg(request.auth[0], pkg):
+            raise HTTPError(403)
+
+
 @app.hook("before_request")
 def log_request():
     log.info(config.log_req_frmt, request.environ)
@@ -59,7 +70,7 @@ def print_request():
     parsed = urlparse(request.urlparts.scheme + "://" + request.urlparts.netloc)
     request.custom_host = parsed.netloc
     request.custom_fullpath = (
-        parsed.path.rstrip("/") + "/" + request.fullpath.lstrip("/")
+            parsed.path.rstrip("/") + "/" + request.fullpath.lstrip("/")
     )
 
 
@@ -126,6 +137,7 @@ def doc_upload():
 
 def remove_pkg():
     name = request.forms.get("name")
+    pkg_verify("remove_pkg", name)
     version = request.forms.get("version")
     if not name or not version:
         msg = f"Missing 'name'/'version' fields: name={name}, version={version}"
@@ -148,8 +160,8 @@ def file_upload():
     if not ufiles.pkg:
         raise HTTPError(400, "Missing 'content' file-field!")
     if (
-        ufiles.sig
-        and f"{ufiles.pkg.raw_filename}.asc" != ufiles.sig.raw_filename
+            ufiles.sig
+            and f"{ufiles.pkg.raw_filename}.asc" != ufiles.sig.raw_filename
     ):
         raise HTTPError(
             400,
@@ -159,9 +171,11 @@ def file_upload():
     for uf in ufiles:
         if not uf:
             continue
+        pkg_name = uf.raw_filename[:uf.raw_filename.rindex("-")]
+        pkg_verify("upload_pkg", pkg_name)
         if (
-            not is_valid_pkg_filename(uf.raw_filename)
-            or guess_pkgname_and_version(uf.raw_filename) is None
+                not is_valid_pkg_filename(uf.raw_filename)
+                or guess_pkgname_and_version(uf.raw_filename) is None
         ):
             raise HTTPError(400, f"Bad filename: {uf.raw_filename}")
 
@@ -349,6 +363,7 @@ def list_packages():
 @app.route("/packages/:filename#.*#")
 @auth("download")
 def server_static(filename):
+    pkg_verify("download_pkg", filename[:filename.rindex("-")])
     entries = config.backend.get_all_packages()
     for x in entries:
         f = x.relfn_unix
